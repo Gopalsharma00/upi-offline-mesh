@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UPI Offline Mesh — Distributed System Demo</title>
+    <meta name="description" content="Interactive visualization of an offline UPI payment system using Bluetooth mesh networking with distributed systems concepts.">
+    <link rel="stylesheet" href="/css/mesh.css">
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <h1>📡 <span>UPI</span> Offline Mesh Network</h1>
+        <div class="header-badges">
+            <span class="badge badge-redis">● Redis Queue + Cache</span>
+            <span class="badge badge-pg">● PostgreSQL Ledger</span>
+            <span class="badge badge-vip">● VIP Priority Bypass</span>
+        </div>
+    </div>
+
+    <div class="app-layout">
+        <!-- ─── Canvas ─── -->
+        <div class="canvas-area">
+            <canvas id="meshCanvas"></canvas>
+
+            <div class="canvas-legend">
+                <div class="legend-row"><span class="legend-dot" style="background:#22c55e;"></span> Online (4G)</div>
+                <div class="legend-row"><span class="legend-dot" style="background:#ef4444;"></span> Offline</div>
+                <div class="legend-row"><span class="legend-dot" style="background:#6366f1;"></span> BLE Packet</div>
+                <div class="legend-row"><span class="legend-dot" style="background:#f59e0b;"></span> VIP Transaction</div>
+                <div style="margin-top:6px; font-size: 0.65rem; color: var(--text-dim);">Drag nodes to move them</div>
+            </div>
+
+            <!-- Concept tags floating on canvas -->
+            <div class="concept-tag" style="bottom:80px;left:50%;transform:translateX(-50%);color:var(--accent);">
+                🔷 Gossip Protocol (Epidemic Broadcast)
+            </div>
+            <div class="concept-tag" style="top:60px;right:16px;color:var(--green);">
+                🏦 Async Settlement Pipeline
+            </div>
+            <div class="concept-tag" style="bottom:80px;right:16px;color:var(--pink);">
+                🔐 RSA-2048 + AES-256-GCM Encryption
+            </div>
+
+            <!-- Canvas bottom controls -->
+            <div class="canvas-controls">
+                <button onclick="sendPacket()">📤 Inject Transaction</button>
+                <button onclick="gossip()">🔄 Gossip Round</button>
+                <button onclick="flushBridges()">📡 Flush to Bank</button>
+                <button onclick="resetMesh()" style="border-color:var(--red);">🗑 Reset</button>
+            </div>
+        </div>
+
+        <!-- ─── Sidebar ─── -->
+        <div class="sidebar">
+            <!-- Transaction Form -->
+            <div class="sidebar-section">
+                <h3>💸 New Transaction</h3>
+                <div class="tx-form">
+                    <div><label>From</label>
+                        <select id="senderVpa">
+                            <option value="alice@demo">alice@demo</option>
+                            <option value="bob@demo">bob@demo</option>
+                            <option value="carol@demo">carol@demo</option>
+                            <option value="dave@demo">dave@demo</option>
+                        </select></div>
+                    <div><label>To</label>
+                        <select id="receiverVpa">
+                            <option value="bob@demo">bob@demo</option>
+                            <option value="alice@demo">alice@demo</option>
+                            <option value="carol@demo">carol@demo</option>
+                            <option value="dave@demo">dave@demo</option>
+                        </select></div>
+                    <div><label>Amount ₹</label>
+                        <input type="number" id="amount" value="50"></div>
+                    <div><label>PIN</label>
+                        <input type="text" id="pin" value="1234" maxlength="4"></div>
+                </div>
+            </div>
+
+            <!-- Bluetooth Range -->
+            <div class="sidebar-section">
+                <h3>📶 Bluetooth Range</h3>
+                <div class="range-control">
+                    <input type="range" min="50" max="400" value="150" oninput="updateRange(this.value)">
+                    <span class="range-val" id="rangeVal">150px</span>
+                </div>
+            </div>
+
+            <!-- Devices -->
+            <div class="sidebar-section">
+                <h3>📱 Mesh Devices</h3>
+                <div id="deviceList" class="device-list"></div>
+                <div class="add-device-form">
+                    <input type="text" id="newDeviceId" placeholder="New device name...">
+                    <button class="btn btn-ghost btn-sm" onclick="addDeviceFromForm()">+ Add</button>
+                </div>
+            </div>
+
+            <!-- Developer Logs -->
+            <div class="sidebar-section" style="min-height:180px; display:flex; flex-direction:column;">
+                <h3>🖥️ Developer Logs</h3>
+                <div id="activityLog" class="log-area" style="flex:1; max-height:200px; overflow-y:auto;"></div>
+            </div>
+
+            <!-- Accounts + Transactions side by side -->
+            <div class="sidebar-section">
+                <h3>🏦 Balances</h3>
+                <div id="accountList" class="account-list"></div>
+            </div>
+            <div class="sidebar-section">
+                <h3>📒 Transactions <span id="txCount" style="color:var(--text-dim);font-weight:400;"></span></h3>
+                <div id="txList" class="account-list"></div>
+            </div>
+
+            <!-- System Design Concepts -->
+            <div class="sidebar-section" style="border-bottom:none;">
+                <h3>🧠 Concepts Used</h3>
+                <div style="font-size:0.65rem; color:var(--text-dim); line-height:1.6;">
+                    ✅ <strong style="color:var(--accent);">Gossip Protocol</strong> ·
+                    ✅ <strong style="color:var(--green);">Idempotency</strong> ·
+                    ✅ <strong style="color:var(--orange);">Rate Limiting</strong> ·
+                    ✅ <strong style="color:var(--cyan);">Async Queue</strong> ·
+                    ✅ <strong style="color:var(--pink);">Encryption</strong> ·
+                    ✅ <strong style="color:var(--text);">PostgreSQL</strong> ·
+                    ✅ <strong style="color:var(--red);">Replay Protection</strong>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/js/mesh.js"></script>
+</body>
+</html>
