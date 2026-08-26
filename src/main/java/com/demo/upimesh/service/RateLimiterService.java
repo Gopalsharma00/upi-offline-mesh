@@ -1,58 +1,53 @@
 package com.demo.upimesh.service;
 
+import com.demo.upimesh.store.RateLimitStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
 
 /**
- * Distributed Rate Limiting using Redis (Fixed Window Algorithm).
- * 
- * Pattern: Priority-based rate limiting.
- * - Standard Bucket: Used for mesh-gossiped packets (strict limit).
- * - VIP Bucket: Used for brand new transactions from the source device (generous limit).
+ * Priority-based rate limiting, fixed window.
+ *
+ * - VIP: a brand-new transaction from the source device. Bypasses the limiter
+ *   entirely, so a user's own payment is never blocked by mesh congestion.
+ * - Standard: a packet that has been gossiped around. Capped per bridge node.
  */
 @Service
 public class RateLimiterService {
 
     private static final Logger log = LoggerFactory.getLogger(RateLimiterService.class);
 
+    private static final int STANDARD_LIMIT_PER_MINUTE = 5;
+    private static final Duration WINDOW_TTL = Duration.ofMinutes(2);
+
     @Autowired
-    private StringRedisTemplate redisTemplate;
+    private RateLimitStore store;
 
     /**
-     * Tries to consume a token for a specific bridge node.
-     * @param bridgeId The ID of the bridge node
-     * @param isVip If true, uses the more generous VIP limit
+     * @param isVip if true, skip the limiter entirely
      * @return true if allowed, false if rate limited
      */
     public boolean tryConsume(String bridgeId, boolean isVip) {
-        // VIP packets (fresh transactions from the source) bypass the rate limiter entirely.
-        // This guarantees that a user's own payment is NEVER blocked by mesh congestion.
         if (isVip) {
-            log.info("[RateLimiter] VIP bypass granted for bridge: {}", bridgeId);
+            log.info("[RateLimiter] VIP bypass for bridge {}", bridgeId);
             return true;
         }
 
-        // Standard mesh packets use a Fixed Window rate limiter backed by Redis.
-        long currentMinute = System.currentTimeMillis() / 60000;
-        String key = "ratelimit:std:" + bridgeId + ":" + currentMinute;
+        // The window is folded into the key, so the store only has to count.
+        long currentMinute = System.currentTimeMillis() / 60_000;
+        long count = store.hit("ratelimit:std:" + bridgeId + ":" + currentMinute, WINDOW_TTL);
 
-        Long count = redisTemplate.opsForValue().increment(key);
-
-        // Set expiry on the first request so the key auto-cleans from Redis
-        if (count != null && count == 1) {
-            redisTemplate.expire(key, Duration.ofMinutes(2));
-        }
-
-        int limit = 5; // 5 standard packets per minute per bridge node
-        boolean allowed = count != null && count <= limit;
+        boolean allowed = count <= STANDARD_LIMIT_PER_MINUTE;
         if (!allowed) {
-            log.warn("[RateLimiter] STANDARD limit exceeded for bridge: {} (count: {})", bridgeId, count);
+            log.warn("[RateLimiter] STANDARD limit exceeded for bridge {} (count {})", bridgeId, count);
         }
         return allowed;
+    }
+
+    public String backend() {
+        return store.backend();
     }
 }

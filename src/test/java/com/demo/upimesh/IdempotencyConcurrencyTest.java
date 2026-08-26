@@ -2,9 +2,9 @@ package com.demo.upimesh;
 
 import com.demo.upimesh.crypto.HybridCryptoService;
 import com.demo.upimesh.crypto.ServerKeyHolder;
+import com.demo.upimesh.model.AccountRepository;
 import com.demo.upimesh.model.MeshPacket;
 import com.demo.upimesh.model.PaymentInstruction;
-import com.demo.upimesh.model.AccountRepository;
 import com.demo.upimesh.service.BridgeIngestionService;
 import com.demo.upimesh.service.DemoService;
 import com.demo.upimesh.service.IdempotencyService;
@@ -20,8 +20,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * The killer test: simulates the "three bridges deliver at the same instant"
- * scenario the user explicitly cared about.
+ * The scenario that matters: one payment, several bridge nodes surfacing at the
+ * same instant, and the ledger moving exactly once.
+ *
+ * Ingestion is asynchronous — ingest() claims the hash and queues, and a worker
+ * decrypts and settles. So these tests assert on the ingest verdict and then
+ * wait on the worker rather than expecting a balance to have moved by the time
+ * ingest() returns.
  */
 @SpringBootTest
 class IdempotencyConcurrencyTest {
@@ -36,21 +41,23 @@ class IdempotencyConcurrencyTest {
     @BeforeEach
     void clear() {
         idempotency.clear();
+        bridge.clearQueue();
     }
 
     @Test
     void singlePacketDeliveredByThreeBridgesSettlesExactlyOnce() throws Exception {
-        // Capture starting balances
         BigDecimal aliceBefore = accounts.findById("alice@demo").orElseThrow().getBalance();
         BigDecimal bobBefore = accounts.findById("bob@demo").orElseThrow().getBalance();
 
-        // One packet, but we'll deliver it from 3 "bridges" simultaneously
         MeshPacket packet = demoService.createPacket(
                 "alice@demo", "bob@demo", new BigDecimal("100.00"), "1234", 5);
 
+        // Only the packet that wins the idempotency claim reaches the worker.
+        CountDownLatch settledOnce = bridge.expectProcessed(1);
+
         ExecutorService pool = Executors.newFixedThreadPool(3);
         CountDownLatch start = new CountDownLatch(1);
-        AtomicInteger settled = new AtomicInteger();
+        AtomicInteger accepted = new AtomicInteger();
         AtomicInteger duplicates = new AtomicInteger();
 
         Future<?>[] futures = new Future[3];
@@ -59,39 +66,81 @@ class IdempotencyConcurrencyTest {
             futures[i] = pool.submit(() -> {
                 try {
                     start.await();
+                    // hopCount 3 keeps every caller on the standard path; the
+                    // limit is 5/min so none of the three is throttled.
                     BridgeIngestionService.IngestResult r = bridge.ingest(packet, node, 3);
-                    if ("SETTLED".equals(r.outcome())) settled.incrementAndGet();
-                    else if ("DUPLICATE_DROPPED".equals(r.outcome())) duplicates.incrementAndGet();
-                } catch (Exception e) { throw new RuntimeException(e); }
+                    switch (r.outcome()) {
+                        case "ACCEPTED_FOR_PROCESSING" -> accepted.incrementAndGet();
+                        case "DUPLICATE_DROPPED" -> duplicates.incrementAndGet();
+                        default -> fail("unexpected outcome: " + r.outcome() + " / " + r.reason());
+                    }
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
             });
         }
 
-        start.countDown(); // release all 3 threads at once
-        for (Future<?> f : futures) f.get(5, TimeUnit.SECONDS);
+        start.countDown();   // release all three at once
+        for (Future<?> f : futures) f.get(10, TimeUnit.SECONDS);
         pool.shutdown();
 
-        assertEquals(1, settled.get(), "exactly one bridge should settle");
-        assertEquals(2, duplicates.get(), "the other two should be duplicates");
+        assertEquals(1, accepted.get(), "exactly one bridge should win the claim");
+        assertEquals(2, duplicates.get(), "the other two should be dropped as duplicates");
 
-        // Balance moved exactly once
+        assertTrue(settledOnce.await(10, TimeUnit.SECONDS), "worker should drain the queued packet");
+
         BigDecimal aliceAfter = accounts.findById("alice@demo").orElseThrow().getBalance();
         BigDecimal bobAfter = accounts.findById("bob@demo").orElseThrow().getBalance();
-        assertEquals(aliceBefore.subtract(new BigDecimal("100.00")), aliceAfter);
-        assertEquals(bobBefore.add(new BigDecimal("100.00")), bobAfter);
+        assertEquals(0, aliceBefore.subtract(new BigDecimal("100.00")).compareTo(aliceAfter),
+                "sender debited exactly once");
+        assertEquals(0, bobBefore.add(new BigDecimal("100.00")).compareTo(bobAfter),
+                "receiver credited exactly once");
     }
 
     @Test
-    void tamperedCiphertextIsRejected() throws Exception {
+    void tamperedCiphertextNeverSettles() throws Exception {
+        BigDecimal aliceBefore = accounts.findById("alice@demo").orElseThrow().getBalance();
+        BigDecimal bobBefore = accounts.findById("bob@demo").orElseThrow().getBalance();
+
         MeshPacket packet = demoService.createPacket(
                 "alice@demo", "bob@demo", new BigDecimal("50.00"), "1234", 5);
 
-        // Flip a byte in the middle of the ciphertext
+        // Flip a byte in the middle of the ciphertext.
         char[] chars = packet.getCiphertext().toCharArray();
         chars[chars.length / 2] = chars[chars.length / 2] == 'A' ? 'B' : 'A';
         packet.setCiphertext(new String(chars));
 
+        CountDownLatch processed = bridge.expectProcessed(1);
+
+        // Tampering is invisible at ingest — the hash is simply of different
+        // bytes, so it is accepted. AES-GCM catches it when the worker decrypts.
         BridgeIngestionService.IngestResult r = bridge.ingest(packet, "bridge-x", 1);
-        assertEquals("INVALID", r.outcome());
+        assertEquals("ACCEPTED_FOR_PROCESSING", r.outcome());
+
+        assertTrue(processed.await(10, TimeUnit.SECONDS), "worker should have attempted the packet");
+
+        assertEquals(0, aliceBefore.compareTo(accounts.findById("alice@demo").orElseThrow().getBalance()),
+                "a tampered packet must not move the sender's balance");
+        assertEquals(0, bobBefore.compareTo(accounts.findById("bob@demo").orElseThrow().getBalance()),
+                "a tampered packet must not move the receiver's balance");
+    }
+
+    @Test
+    void replayOfAnAlreadySettledPacketIsDropped() throws Exception {
+        MeshPacket packet = demoService.createPacket(
+                "carol@demo", "dave@demo", new BigDecimal("25.00"), "1234", 5);
+
+        CountDownLatch first = bridge.expectProcessed(1);
+        assertEquals("ACCEPTED_FOR_PROCESSING", bridge.ingest(packet, "bridge-a", 1).outcome());
+        assertTrue(first.await(10, TimeUnit.SECONDS));
+
+        BigDecimal carolAfterFirst = accounts.findById("carol@demo").orElseThrow().getBalance();
+
+        // Same ciphertext replayed much later still loses to the claim.
+        assertEquals("DUPLICATE_DROPPED", bridge.ingest(packet, "bridge-b", 1).outcome());
+
+        assertEquals(0, carolAfterFirst.compareTo(accounts.findById("carol@demo").orElseThrow().getBalance()),
+                "a replayed packet must not debit twice");
     }
 
     @Test

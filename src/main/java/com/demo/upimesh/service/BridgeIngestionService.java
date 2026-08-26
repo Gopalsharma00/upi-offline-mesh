@@ -4,6 +4,8 @@ import com.demo.upimesh.crypto.HybridCryptoService;
 import com.demo.upimesh.model.MeshPacket;
 import com.demo.upimesh.model.PaymentInstruction;
 import com.demo.upimesh.model.Transaction;
+import com.demo.upimesh.store.TaskQueue;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -12,26 +14,23 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.time.Instant;
 import java.time.Duration;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.Instant;
+import java.util.concurrent.CountDownLatch;
 
 /**
- * Orchestrates the full server-side pipeline for one inbound packet from a
- * bridge node:
+ * Server-side pipeline for one inbound packet from a bridge node:
  *
- *   1. Rate limiting (Token Bucket).
+ *   1. Rate limiting — VIP packets bypass, gossiped ones are capped.
  *   2. Hash the ciphertext.
- *   3. Try to claim that hash via the idempotency cache (Synchronous).
- *      - If already claimed: this is a duplicate. Drop it immediately.
- *   4. If new, push the packet to an Async Message Queue and return 202 ACCEPTED.
+ *   3. Claim that hash. Already claimed means duplicate: drop it.
+ *   4. Queue the packet and return ACCEPTED_FOR_PROCESSING.
  *
- *   --- Asynchronous Worker Pipeline ---
- *   5. A background thread pulls from the queue.
- *   6. Decrypt the ciphertext with the server's private key (CPU heavy).
- *   7. Check freshness — reject if signedAt is too old (replay protection).
- *   8. Hand off to SettlementService for the actual debit/credit.
+ *   --- worker thread ---
+ *   5. Pull from the queue.
+ *   6. Decrypt with the server's private key (CPU heavy, hence off-thread).
+ *   7. Reject anything older than the freshness window (replay protection).
+ *   8. Hand to SettlementService for the debit/credit.
  */
 @Service
 public class BridgeIngestionService {
@@ -42,53 +41,52 @@ public class BridgeIngestionService {
     @Autowired private IdempotencyService idempotency;
     @Autowired private SettlementService settlement;
     @Autowired private RateLimiterService rateLimiter;
-    @Autowired private StringRedisTemplate redisTemplate;
+    @Autowired private TaskQueue queue;
     @Autowired private ObjectMapper objectMapper;
 
     @Value("${upi.mesh.packet-max-age-seconds:86400}")
     private long maxAgeSeconds;
 
-    // The distributed Message Queue using Redis List
-    private static final String QUEUE_KEY = "ingestion_queue";
     private Thread workerThread;
     private volatile boolean running = true;
 
-    public record IngestionTask(MeshPacket packet, String bridgeNodeId, int hopCount, String packetHash) {}
+    /** Counts packets that have finished the worker, so tests can wait deterministically. */
+    private volatile CountDownLatch drainLatch = new CountDownLatch(0);
 
-    private static final long BACKOFF_MIN_MS = 1_000L;
-    private static final long BACKOFF_MAX_MS = 60_000L;
+    public record IngestionTask(MeshPacket packet, String bridgeNodeId, int hopCount, String packetHash) {}
 
     @PostConstruct
     public void startAsyncWorker() {
         workerThread = new Thread(() -> {
-            log.info("AsyncDecryptionWorker started. Listening to Redis queue...");
-            long backoffMs = BACKOFF_MIN_MS;
+            log.info("AsyncDecryptionWorker started on the {} queue", queue.backend());
+            long backoffMs = 1_000L;
             long failureStreak = 0;
 
             while (running) {
                 try {
-                    // Block for up to 1 second waiting for an element
-                    String jsonTask = redisTemplate.opsForList().leftPop(QUEUE_KEY, Duration.ofSeconds(1));
+                    String jsonTask = queue.poll(Duration.ofSeconds(1));
                     if (jsonTask != null) {
-                        IngestionTask task = objectMapper.readValue(jsonTask, IngestionTask.class);
-                        processTaskAsynchronously(task);
+                        try {
+                            processTask(objectMapper.readValue(jsonTask, IngestionTask.class));
+                        } finally {
+                            drainLatch.countDown();
+                        }
                     }
                     if (failureStreak > 0) {
-                        log.info("Redis reachable again after {} failed attempt(s)", failureStreak);
+                        log.info("Queue reachable again after {} failed attempt(s)", failureStreak);
                         failureStreak = 0;
-                        backoffMs = BACKOFF_MIN_MS;
+                        backoffMs = 1_000L;
                     }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
                 } catch (Exception e) {
-                    // Catch everything so the worker thread doesn't die silently.
-                    //
-                    // When Redis is gone the queue poll fails on every pass. Retrying
-                    // once a second and printing a full stack trace each time buries
-                    // the logs and burns CPU we do not have, so back off to a minute
-                    // and log the first failure of each streak at ERROR, the rest at
-                    // DEBUG.
+                    // Never let the worker die. Back off rather than spinning: a
+                    // broken queue used to retry every second and print a stack
+                    // trace each time, which buried the log.
                     failureStreak++;
                     if (failureStreak == 1) {
-                        log.error("Worker cannot reach Redis: {} — backing off, will keep retrying", e.getMessage(), e);
+                        log.error("Worker cannot read the queue: {} — backing off, still retrying", e.getMessage(), e);
                     } else {
                         log.debug("Worker retry {} still failing: {}", failureStreak, e.getMessage());
                     }
@@ -98,7 +96,7 @@ public class BridgeIngestionService {
                         Thread.currentThread().interrupt();
                         break;
                     }
-                    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+                    backoffMs = Math.min(backoffMs * 2, 60_000L);
                 }
             }
         });
@@ -110,38 +108,31 @@ public class BridgeIngestionService {
     @PreDestroy
     public void stopAsyncWorker() {
         running = false;
-        if (workerThread != null) {
-            workerThread.interrupt();
-        }
+        if (workerThread != null) workerThread.interrupt();
     }
 
     public IngestResult ingest(MeshPacket packet, String bridgeNodeId, int hopCount) {
         try {
-            // ---- Rate Limiting (Priority-based) ----
-            // hopCount <= 1 means this is a fresh transaction (0 = injected directly at bridge,
-            // 1 = gossiped exactly once before reaching a bridge).
-            // These VIP packets bypass the rate limiter entirely so your own payment is NEVER blocked.
+            // hopCount <= 1 means a fresh transaction: injected at a bridge, or
+            // gossiped exactly once before reaching one. These bypass the limiter
+            // so a user's own payment is never blocked by mesh congestion.
             boolean isVip = (hopCount <= 1);
             if (!rateLimiter.tryConsume(bridgeNodeId, isVip)) {
-                log.warn("STANDARD RATE LIMIT EXCEEDED for bridge {} — packet throttled", bridgeNodeId);
+                log.warn("Rate limit exceeded for bridge {} — packet throttled", bridgeNodeId);
                 return IngestResult.throttled(bridgeNodeId);
             }
 
             String packetHash = crypto.hashCiphertext(packet.getCiphertext());
 
-            // ---- Idempotency gate (Synchronous fast-path) ----
             if (!idempotency.claim(packetHash)) {
-                log.info("DUPLICATE packet {} from bridge {} — dropped",
-                        packetHash.substring(0, 12) + "...", bridgeNodeId);
+                log.info("DUPLICATE packet {} from bridge {} — dropped", shortHash(packetHash), bridgeNodeId);
                 return IngestResult.duplicate(packetHash);
             }
 
-            // ---- Enqueue for Async Processing (Distributed Queue) ----
-            IngestionTask task = new IngestionTask(packet, bridgeNodeId, hopCount, packetHash);
-            String jsonTask = objectMapper.writeValueAsString(task);
-            redisTemplate.opsForList().rightPush(QUEUE_KEY, jsonTask);
-            log.info("ACCEPTED packet {} from bridge {} — queued to Redis for async processing",
-                    packetHash.substring(0, 12) + "...", bridgeNodeId);
+            queue.push(objectMapper.writeValueAsString(
+                    new IngestionTask(packet, bridgeNodeId, hopCount, packetHash)));
+            log.info("ACCEPTED packet {} from bridge {} — queued for decryption",
+                    shortHash(packetHash), bridgeNodeId);
 
             return new IngestResult("ACCEPTED_FOR_PROCESSING", packetHash, "Queued for decryption", null);
 
@@ -151,42 +142,67 @@ public class BridgeIngestionService {
         }
     }
 
-    private void processTaskAsynchronously(IngestionTask task) {
-        log.info("[AsyncWorker] Processing packet {}", task.packetHash().substring(0, 12) + "...");
-        
-        // ---- Decrypt (CPU Heavy) ----
+    private void processTask(IngestionTask task) {
+        log.info("[AsyncWorker] Processing packet {}", shortHash(task.packetHash()));
+
         PaymentInstruction instruction;
         try {
-            // Simulating CPU work
-            Thread.sleep(200);
+            Thread.sleep(200);   // stand-in for the real RSA cost
             instruction = crypto.decrypt(task.packet().getCiphertext());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            return;
         } catch (Exception e) {
             log.warn("[AsyncWorker] Decryption failed for packet {}: {}",
-                    task.packetHash().substring(0, 12) + "...", e.getMessage());
+                    shortHash(task.packetHash()), e.getMessage());
             return;
         }
 
-        // ---- Freshness check (replay protection) ----
         long ageSeconds = (Instant.now().toEpochMilli() - instruction.getSignedAt()) / 1000;
         if (ageSeconds > maxAgeSeconds) {
-            log.warn("[AsyncWorker] Packet {} too old ({}s), rejected",
-                    task.packetHash().substring(0, 12) + "...", ageSeconds);
+            log.warn("[AsyncWorker] Packet {} too old ({}s), rejected", shortHash(task.packetHash()), ageSeconds);
             return;
         }
-        if (ageSeconds < -300) { // small clock-skew tolerance
-            log.warn("[AsyncWorker] Packet {} is future-dated, rejected",
-                    task.packetHash().substring(0, 12) + "...");
+        if (ageSeconds < -300) {   // small clock-skew tolerance
+            log.warn("[AsyncWorker] Packet {} is future-dated, rejected", shortHash(task.packetHash()));
             return;
         }
 
-    // ---- Settle ----
-        settlement.settle(instruction, task.packetHash(), task.bridgeNodeId(), task.hopCount());
-        log.info("[AsyncWorker] Successfully settled packet {}", task.packetHash().substring(0, 12) + "...");
+        try {
+            settlement.settle(instruction, task.packetHash(), task.bridgeNodeId(), task.hopCount());
+            log.info("[AsyncWorker] Settled packet {}", shortHash(task.packetHash()));
+        } catch (Exception e) {
+            log.warn("[AsyncWorker] Settlement failed for packet {}: {}",
+                    shortHash(task.packetHash()), e.getMessage());
+        }
+    }
+
+    /**
+     * Arm a latch for the next {@code expected} packets to clear the worker, so a
+     * test can await the async pipeline instead of sleeping and hoping.
+     */
+    public CountDownLatch expectProcessed(int expected) {
+        CountDownLatch latch = new CountDownLatch(expected);
+        this.drainLatch = latch;
+        return latch;
     }
 
     public void clearQueue() {
-        redisTemplate.delete(QUEUE_KEY);
-        log.info("Redis async ingestion queue cleared");
+        queue.clear();
+        log.info("Ingestion queue cleared");
+    }
+
+    public int queueDepth() {
+        return queue.depth();
+    }
+
+    public String backend() {
+        return queue.backend();
+    }
+
+    private static String shortHash(String hash) {
+        if (hash == null) return "unknown";
+        return (hash.length() > 12 ? hash.substring(0, 12) : hash) + "...";
     }
 
     public record IngestResult(String outcome, String packetHash, String reason, Long transactionId) {

@@ -23,7 +23,7 @@
 <header class="titlebar">
   <span class="title">upi-offline-mesh</span>
   <nav class="deps" aria-label="Dependency status">
-    <span class="dep" id="depRedis" data-state="idle">redis <b class="dep-val">—</b></span>
+    <span class="dep" id="depStore" data-state="idle">store <b class="dep-val">—</b></span>
     <span class="dep" id="depDb"    data-state="idle">postgres <b class="dep-val">—</b></span>
     <span class="dep" id="depMesh"  data-state="idle">mesh <b class="dep-val">—</b></span>
   </nav>
@@ -129,6 +129,7 @@
   <span class="st"><b id="mPackets">0</b> in flight</span>
   <span class="st"><b id="mBridges">0</b> bridges</span>
   <span class="st"><b id="mDedup">0</b> dedup</span>
+  <span class="st"><b id="mQueue">0</b> queued</span>
   <span class="st"><b id="mSettled">0</b> settled</span>
   <span class="st st-right" id="stState">idle</span>
 </footer>

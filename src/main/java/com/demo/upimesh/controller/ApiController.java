@@ -92,23 +92,13 @@ public class ApiController {
             ));
         }
 
-        // The mesh is in-memory, so device state is always available. Only the
-        // idempotency cache count needs Redis. If Redis is down, report the
-        // count as 0 and flag it — failing the whole endpoint costs the
-        // dashboard every node over a dependency it does not need to draw them.
-        int cacheSize = 0;
-        boolean redisAvailable = true;
-        try {
-            cacheSize = idempotency.size();
-        } catch (Exception e) {
-            redisAvailable = false;
-            log.warn("Redis unavailable — reporting idempotency cache size as 0: {}", e.getMessage());
-        }
-
         Map<String, Object> state = new HashMap<>();
         state.put("devices", deviceData);
-        state.put("idempotencyCacheSize", cacheSize);
-        state.put("redisAvailable", redisAvailable);
+        state.put("idempotencyCacheSize", idempotency.size());
+        state.put("queueDepth", bridge.queueDepth());
+        // "memory" or "redis" — every feature works either way; redis only widens
+        // the guarantee from one instance to the whole cluster.
+        state.put("store", idempotency.backend());
         return state;
     }
 
@@ -199,7 +189,8 @@ public class ApiController {
         bridge.clearQueue();
         txRepo.deleteAll();
         demo.resetAccounts();
-        return Map.of("status", "FULL SYSTEM RESET: Mesh, Idempotency, Queue, Ledger, and Balances cleared.");
+        return Map.of("status", "FULL SYSTEM RESET: Mesh, Idempotency, Queue, Ledger, and Balances cleared.",
+                "store", idempotency.backend());
     }
 
     // -------------------------------------------------------------- bridge

@@ -298,7 +298,7 @@ function setState(text, kind = '') {
 
 // ─── Refresh ─────────────────────────────────────────────────────────────────
 let refreshFailures = 0;
-let redisWarned = false;
+let storeAnnounced = false;
 
 function logRefreshFailure(e) {
   refreshFailures++;
@@ -322,11 +322,15 @@ async function refresh() {
   }
 
   if (state) {
-    const redisUp = state.redisAvailable !== false;
-    setDep('depRedis', redisUp ? 'up' : 'down', redisUp ? 'ok' : 'down');
-    if (!redisUp && !redisWarned) {
-      redisWarned = true;
-      logMsg('redis unreachable: settlement offline. gossip works, flush will not settle', 'throttled');
+    // Both backends are fully functional; redis only widens the guarantee from
+    // one instance to the cluster. So this reports which one is live, not health.
+    const store = state.store || 'memory';
+    setDep('depStore', 'up', store);
+    if (!storeAnnounced) {
+      storeAnnounced = true;
+      logMsg(store === 'redis'
+        ? 'store: redis — idempotency, rate limiting and queue are distributed'
+        : 'store: in-memory — single instance, no external services required');
     }
 
     const deviceData = state.devices || [];
@@ -350,6 +354,7 @@ async function refresh() {
     setText('mPackets', inFlight);
     setText('mBridges', bridges);
     setText('mDedup', state.idempotencyCacheSize ?? 0);
+    setText('mQueue', state.queueDepth ?? 0);
     setDep('depMesh', 'up', nodes.length + 'n');
   }
 
@@ -513,7 +518,7 @@ async function resetMesh() {
   } catch (e) {
     // Reset clears the Redis dedup cache and queue first, so it fails as a unit
     // whenever Redis is down.
-    logMsg(`Reset failed (${e.message}) — requires Redis`, 'throttled');
+    logMsg(`reset failed (${e.message})`, 'throttled');
   }
   refresh();
 }

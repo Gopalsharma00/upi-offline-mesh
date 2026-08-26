@@ -1,29 +1,30 @@
 package com.demo.upimesh.service;
 
+import com.demo.upimesh.store.IdempotencyStore;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.Duration;
-import java.util.Set;
 
 /**
- * Distributed idempotency cache using Redis SETNX + TTL.
+ * Idempotency cache.
  *
  * The contract:
  *   - claim(hash) returns true on first call, false on every call after that
- *     (within the TTL window)
- *   - the operation is atomic — even if 100 nodes call claim(hash) at the
- *     same instant, exactly one returns true
+ *     within the TTL window
+ *   - the operation is atomic — if 100 threads call claim(hash) at the same
+ *     instant, exactly one returns true
  *
- * This is what kills the "three bridges deliver simultaneously" problem across a cluster.
+ * This is what kills the "three bridges deliver simultaneously" problem. On the
+ * in-memory store the guarantee holds within one instance; point REDIS_HOST at a
+ * server and it holds across the whole cluster.
  */
 @Service
 public class IdempotencyService {
 
     @Autowired
-    private StringRedisTemplate redisTemplate;
+    private IdempotencyStore store;
 
     @Value("${upi.mesh.idempotency-ttl-seconds:86400}")
     private long ttlSeconds;
@@ -33,22 +34,19 @@ public class IdempotencyService {
      * someone else already claimed it (i.e. the packet is a duplicate).
      */
     public boolean claim(String packetHash) {
-        String key = "idemp:" + packetHash;
-        Boolean success = redisTemplate.opsForValue().setIfAbsent(key, "1", Duration.ofSeconds(ttlSeconds));
-        return Boolean.TRUE.equals(success);
+        return store.claim("idemp:" + packetHash, Duration.ofSeconds(ttlSeconds));
     }
 
     public int size() {
-        // Warning: KEYS is generally bad practice in production Redis, but acceptable for this demo
-        Set<String> keys = redisTemplate.keys("idemp:*");
-        return keys == null ? 0 : keys.size();
+        return store.size();
     }
 
     /** Test/demo helper. */
     public void clear() {
-        Set<String> keys = redisTemplate.keys("idemp:*");
-        if (keys != null && !keys.isEmpty()) {
-            redisTemplate.delete(keys);
-        }
+        store.clear();
+    }
+
+    public String backend() {
+        return store.backend();
     }
 }
