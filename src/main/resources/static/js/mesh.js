@@ -185,29 +185,60 @@ async function api(url, method = 'GET', body = null) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
+  if (!r.ok) throw new Error(`${method} ${url} -> HTTP ${r.status}`);
   return r.json();
 }
 
 // ─── Refresh state ───
+let refreshFailures = 0;
+let redisWarned = false;
+
+function logRefreshFailure(e) {
+  refreshFailures++;
+  // refresh() polls every 5s. Log the first failure, then once a minute, so an
+  // outage reports itself without flooding the log pane.
+  if (refreshFailures === 1 || refreshFailures % 12 === 0) {
+    logMsg(`❌ Backend unreachable (${e.message}) — showing last known mesh state`, 'throttled');
+  }
+}
+
 async function refresh() {
-  const state = await api('/api/mesh/state');
-  const deviceData = state.devices || [];
-  // Update existing nodes or add new ones
-  deviceData.forEach(d => {
-    let n = nodes.find(nd => nd.deviceId === d.deviceId);
-    if (n) {
-      n.hasInternet = d.hasInternet;
-      n.packetCount = d.packetCount;
-      n.packetIds = d.packetIds;
-    } else {
-      nodes.push({ deviceId: d.deviceId, hasInternet: d.hasInternet, packetCount: d.packetCount, packetIds: d.packetIds });
+  let state = null;
+  try {
+    state = await api('/api/mesh/state');
+    refreshFailures = 0;
+  } catch (e) {
+    // Keep whatever is already drawn. Wiping every node because one poll failed
+    // is what turned a backend outage into an empty canvas.
+    logRefreshFailure(e);
+  }
+
+  if (state) {
+    if (state.redisAvailable === false && !redisWarned) {
+      redisWarned = true;
+      logMsg('⚠ Redis unreachable — settlement pipeline is offline. Mesh simulation still works, but Flush to Bank will not settle.', 'throttled');
     }
-  });
-  // Remove nodes no longer in backend
-  nodes = nodes.filter(n => deviceData.some(d => d.deviceId === n.deviceId));
-  layoutNodes();
-  // Update sidebar
-  updateDeviceList();
+
+    const deviceData = state.devices || [];
+    // Update existing nodes or add new ones
+    deviceData.forEach(d => {
+      let n = nodes.find(nd => nd.deviceId === d.deviceId);
+      if (n) {
+        n.hasInternet = d.hasInternet;
+        n.packetCount = d.packetCount;
+        n.packetIds = d.packetIds;
+      } else {
+        nodes.push({ deviceId: d.deviceId, hasInternet: d.hasInternet, packetCount: d.packetCount, packetIds: d.packetIds });
+      }
+    });
+    // Remove nodes no longer in backend
+    nodes = nodes.filter(n => deviceData.some(d => d.deviceId === n.deviceId));
+    layoutNodes();
+    updateDeviceList();
+  }
+
+  // Balances and transactions come from Postgres and are independent of the
+  // mesh endpoint — keep them refreshing even when the mesh poll fails.
   updateAccounts();
   updateTransactions();
 }
@@ -340,17 +371,27 @@ async function flushBridges() {
 }
 
 async function resetMesh() {
-  await api('/api/mesh/reset', 'POST');
-  logMsg('🗑 Full system reset: Mesh + Redis + DB cleared');
-  // Keep node positions intact, just reset their packet counts visually
-  nodes.forEach(n => { n.packetCount = 0; n.packetIds = []; });
+  try {
+    await api('/api/mesh/reset', 'POST');
+    logMsg('🗑 Full system reset: Mesh + Redis + DB cleared');
+    // Keep node positions intact, just reset their packet counts visually
+    nodes.forEach(n => { n.packetCount = 0; n.packetIds = []; });
+  } catch (e) {
+    // The reset endpoint clears the Redis idempotency cache and queue first, so
+    // it fails as a unit whenever Redis is down.
+    logMsg(`❌ Reset failed (${e.message}) — needs Redis`, 'throttled');
+  }
   refresh();
 }
 
 async function toggleInternet(deviceId) {
-  await api(`/api/mesh/device/${deviceId}/toggle-internet`, 'POST');
-  const n = nodes.find(nd => nd.deviceId === deviceId);
-  logMsg(`⚡ ${deviceId} → ${n && !n.hasInternet ? 'ONLINE' : 'OFFLINE'}`);
+  try {
+    await api(`/api/mesh/device/${deviceId}/toggle-internet`, 'POST');
+    const n = nodes.find(nd => nd.deviceId === deviceId);
+    logMsg(`⚡ ${deviceId} → ${n && !n.hasInternet ? 'ONLINE' : 'OFFLINE'}`);
+  } catch (e) {
+    logMsg(`❌ Could not toggle ${deviceId} (${e.message})`, 'throttled');
+  }
   refresh();
 }
 
@@ -358,15 +399,23 @@ async function addDeviceFromForm() {
   const input = document.getElementById('newDeviceId');
   const id = 'phone-' + input.value.trim().toLowerCase().replace(/\s+/g, '-');
   if (!input.value.trim()) return;
-  await api('/api/mesh/device/add', 'POST', { deviceId: id, hasInternet: false });
-  input.value = '';
-  logMsg(`➕ Added device ${id}`);
+  try {
+    await api('/api/mesh/device/add', 'POST', { deviceId: id, hasInternet: false });
+    input.value = '';
+    logMsg(`➕ Added device ${id}`);
+  } catch (e) {
+    logMsg(`❌ Could not add ${id} (${e.message})`, 'throttled');
+  }
   refresh();
 }
 
 async function removeDevice(deviceId) {
-  await api(`/api/mesh/device/${deviceId}/remove`, 'POST');
-  logMsg(`➖ Removed device ${deviceId}`);
+  try {
+    await api(`/api/mesh/device/${deviceId}/remove`, 'POST');
+    logMsg(`➖ Removed device ${deviceId}`);
+  } catch (e) {
+    logMsg(`❌ Could not remove ${deviceId} (${e.message})`, 'throttled');
+  }
   refresh();
 }
 

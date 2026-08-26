@@ -87,14 +87,35 @@ public class ApiController {
                     "hasInternet", d.hasInternet(),
                     "packetCount", d.packetCount(),
                     "packetIds", d.getHeldPackets().stream()
-                            .map(p -> p.getPacketId().substring(0, 8))
+                            .map(p -> shortId(p.getPacketId()))
                             .toList()
             ));
         }
-        return Map.of(
-                "devices", deviceData,
-                "idempotencyCacheSize", idempotency.size()
-        );
+
+        // The mesh is in-memory, so device state is always available. Only the
+        // idempotency cache count needs Redis. If Redis is down, report the
+        // count as 0 and flag it — failing the whole endpoint costs the
+        // dashboard every node over a dependency it does not need to draw them.
+        int cacheSize = 0;
+        boolean redisAvailable = true;
+        try {
+            cacheSize = idempotency.size();
+        } catch (Exception e) {
+            redisAvailable = false;
+            log.warn("Redis unavailable — reporting idempotency cache size as 0: {}", e.getMessage());
+        }
+
+        Map<String, Object> state = new HashMap<>();
+        state.put("devices", deviceData);
+        state.put("idempotencyCacheSize", cacheSize);
+        state.put("redisAvailable", redisAvailable);
+        return state;
+    }
+
+    /** Packet ids are UUIDs, but never assume — a short or null id must not 500 the dashboard. */
+    private static String shortId(String packetId) {
+        if (packetId == null) return "unknown";
+        return packetId.length() >= 8 ? packetId.substring(0, 8) : packetId;
     }
 
     @PostMapping("/mesh/gossip")
