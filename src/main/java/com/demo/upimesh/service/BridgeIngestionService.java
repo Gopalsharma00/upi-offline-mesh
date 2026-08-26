@@ -55,10 +55,16 @@ public class BridgeIngestionService {
 
     public record IngestionTask(MeshPacket packet, String bridgeNodeId, int hopCount, String packetHash) {}
 
+    private static final long BACKOFF_MIN_MS = 1_000L;
+    private static final long BACKOFF_MAX_MS = 60_000L;
+
     @PostConstruct
     public void startAsyncWorker() {
         workerThread = new Thread(() -> {
             log.info("AsyncDecryptionWorker started. Listening to Redis queue...");
+            long backoffMs = BACKOFF_MIN_MS;
+            long failureStreak = 0;
+
             while (running) {
                 try {
                     // Block for up to 1 second waiting for an element
@@ -67,14 +73,37 @@ public class BridgeIngestionService {
                         IngestionTask task = objectMapper.readValue(jsonTask, IngestionTask.class);
                         processTaskAsynchronously(task);
                     }
+                    if (failureStreak > 0) {
+                        log.info("Redis reachable again after {} failed attempt(s)", failureStreak);
+                        failureStreak = 0;
+                        backoffMs = BACKOFF_MIN_MS;
+                    }
                 } catch (Exception e) {
-                    // Catch everything so the worker thread doesn't die silently
-                    log.error("Worker encountered an error: {}", e.getMessage(), e);
-                    try { Thread.sleep(1000); } catch(InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                    // Catch everything so the worker thread doesn't die silently.
+                    //
+                    // When Redis is gone the queue poll fails on every pass. Retrying
+                    // once a second and printing a full stack trace each time buries
+                    // the logs and burns CPU we do not have, so back off to a minute
+                    // and log the first failure of each streak at ERROR, the rest at
+                    // DEBUG.
+                    failureStreak++;
+                    if (failureStreak == 1) {
+                        log.error("Worker cannot reach Redis: {} — backing off, will keep retrying", e.getMessage(), e);
+                    } else {
+                        log.debug("Worker retry {} still failing: {}", failureStreak, e.getMessage());
+                    }
+                    try {
+                        Thread.sleep(backoffMs);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
                 }
             }
         });
         workerThread.setName("AsyncDecryptionWorker");
+        workerThread.setDaemon(true);
         workerThread.start();
     }
 

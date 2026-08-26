@@ -1,59 +1,121 @@
-// ─── State ───
+// ─── State ───────────────────────────────────────────────────────────────────
 let nodes = [];
 let animations = [];
 let bluetoothRange = 150;
 let dragNode = null;
+let hoverNode = null;
+let rangeRevealUntil = 0;
 let dragOffX = 0, dragOffY = 0;
+let rafId = null;
+let pollId = null;
+
 const canvas = document.getElementById('meshCanvas');
 const ctx = canvas.getContext('2d');
 
-// ─── Resize ───
+// Palette mirrors the CSS custom properties so canvas and DOM stay in step.
+const C = {
+  online:  '#22c55e',
+  offline: '#64748b',
+  packet:  '#3b82f6',
+  vip:     '#f59e0b',
+  label:   '#94a3b8',
+  ring:    'rgba(59,130,246,0.07)',
+  link:    'rgba(96,125,170,',
+  faceOn:  '#12301f',
+  faceOff: '#16203a',
+};
+
+// ─── Sizing ──────────────────────────────────────────────────────────────────
+// Back the canvas with devicePixelRatio so nodes and labels stay crisp on
+// high-density displays instead of being upscaled from CSS pixels.
 function resize() {
-  canvas.width = canvas.parentElement.clientWidth;
-  canvas.height = canvas.parentElement.clientHeight;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = canvas.parentElement.clientWidth;
+  const h = canvas.parentElement.clientHeight;
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
-window.addEventListener('resize', resize);
+window.addEventListener('resize', () => { resize(); layoutNodes(true); });
 resize();
 
-// ─── Node positions (circle layout) ───
-function layoutNodes() {
-  const cx = canvas.width / 2, cy = canvas.height / 2;
-  const radius = Math.min(cx, cy) * 0.38;
+function viewW() { return canvas.parentElement.clientWidth; }
+function viewH() { return canvas.parentElement.clientHeight; }
+
+// ─── Node positions (circle layout) ──────────────────────────────────────────
+function layoutNodes(force = false) {
+  const cx = viewW() / 2, cy = viewH() / 2;
+  const radius = Math.min(cx, cy) * 0.55;
   nodes.forEach((n, i) => {
-    if (n.x !== undefined && n.y !== undefined) return; // keep dragged positions
+    if (!force && n.x !== undefined && n.y !== undefined) return; // keep dragged positions
     const angle = (i / nodes.length) * Math.PI * 2 - Math.PI / 2;
     n.x = cx + Math.cos(angle) * radius;
     n.y = cy + Math.sin(angle) * radius;
   });
 }
 
-// ─── Draw ───
-function draw() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  const time = Date.now();
-
-  // Draw bluetooth range circles
-  nodes.forEach(n => {
+// ─── Draw ────────────────────────────────────────────────────────────────────
+function drawSignalGlyph(x, y, online) {
+  // Three stacked arcs plus a dot. Replaces the emoji that used to be painted
+  // here, which rendered differently on every platform.
+  ctx.strokeStyle = online ? C.online : C.offline;
+  ctx.lineWidth = 1.4;
+  ctx.lineCap = 'round';
+  const arcs = online ? [8, 5.5] : [5.5];
+  arcs.forEach(r => {
     ctx.beginPath();
-    ctx.arc(n.x, n.y, bluetoothRange, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(99,102,241,0.08)';
-    ctx.lineWidth = 1;
+    ctx.arc(x, y + 4, r, Math.PI * 1.22, Math.PI * 1.78);
     ctx.stroke();
   });
+  ctx.beginPath();
+  ctx.arc(x, y + 4.5, 1.35, 0, Math.PI * 2);
+  ctx.fillStyle = online ? C.online : C.offline;
+  ctx.fill();
+  if (!online) {
+    ctx.beginPath();
+    ctx.moveTo(x - 8, y - 5);
+    ctx.lineTo(x + 8, y + 8);
+    ctx.strokeStyle = C.offline;
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+}
 
-  // Draw connections between nodes in range
+function draw() {
+  const w = viewW(), h = viewH();
+  ctx.clearRect(0, 0, w, h);
+  const time = Date.now();
+
+  // Range rings. Drawing one per node at all times buried the topology in
+  // overlapping circles, so they appear for the node you are touching and for a
+  // moment after the range slider moves.
+  const revealAll = time < rangeRevealUntil;
+  nodes.forEach(n => {
+    const focused = n === dragNode || n === hoverNode;
+    if (!focused && !revealAll) return;
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, bluetoothRange, 0, Math.PI * 2);
+    ctx.strokeStyle = focused ? 'rgba(59,130,246,0.30)' : C.ring;
+    ctx.setLineDash(focused ? [] : [2, 6]);
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.setLineDash([]);
+  });
+
+  // Links between in-range pairs
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
       const a = nodes[i], b = nodes[j];
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
       if (dist <= bluetoothRange * 2) {
-        const opacity = Math.max(0.03, 0.2 - (dist / (bluetoothRange * 2)) * 0.17);
+        const opacity = Math.max(0.06, 0.26 - (dist / (bluetoothRange * 2)) * 0.2);
         ctx.beginPath();
         ctx.moveTo(a.x, a.y);
         ctx.lineTo(b.x, b.y);
-        // Dashed line for bluetooth
-        ctx.setLineDash([4, 6]);
-        ctx.strokeStyle = `rgba(99,102,241,${opacity})`;
+        ctx.setLineDash([3, 5]);
+        ctx.strokeStyle = C.link + opacity + ')';
         ctx.lineWidth = 1;
         ctx.stroke();
         ctx.setLineDash([]);
@@ -61,126 +123,147 @@ function draw() {
     }
   }
 
-  // Draw packet transfer animations
+  // Packets in transit
   animations = animations.filter(a => {
     const elapsed = time - a.start;
+    if (elapsed < 0) return true;
     const duration = a.duration || 800;
     if (elapsed > duration) return false;
     const t = elapsed / duration;
     const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
     const x = a.fromX + (a.toX - a.fromX) * eased;
     const y = a.fromY + (a.toY - a.fromY) * eased;
-    // Glowing packet dot
+    const color = a.color || C.packet;
+
+    const trailT = Math.max(0, eased - 0.1);
     ctx.beginPath();
-    ctx.arc(x, y, 5, 0, Math.PI * 2);
-    const color = a.color || '#6366f1';
+    ctx.moveTo(a.fromX + (a.toX - a.fromX) * trailT, a.fromY + (a.toY - a.fromY) * trailT);
+    ctx.lineTo(x, y);
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = 0.35;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    ctx.beginPath();
+    ctx.arc(x, y, 3.2, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x, y, 10, 0, Math.PI * 2);
-    ctx.fillStyle = color.replace(')', ',0.2)').replace('rgb', 'rgba');
-    ctx.fill();
-    // Trail
-    const trailT = Math.max(0, eased - 0.08);
-    const tx = a.fromX + (a.toX - a.fromX) * trailT;
-    const ty = a.fromY + (a.toY - a.fromY) * trailT;
-    ctx.beginPath();
-    ctx.moveTo(tx, ty); ctx.lineTo(x, y);
-    ctx.strokeStyle = color.replace(')', ',0.4)').replace('rgb', 'rgba');
-    ctx.lineWidth = 2;
-    ctx.stroke();
     return true;
   });
 
-  // Draw nodes
+  // Nodes
   nodes.forEach(n => {
-    const isOnline = n.hasInternet;
+    const online = n.hasInternet;
     const pkts = n.packetCount || 0;
-    // Glow if has packets
-    if (pkts > 0) {
-      const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, 35);
-      grd.addColorStop(0, 'rgba(99,102,241,0.25)');
-      grd.addColorStop(1, 'rgba(99,102,241,0)');
-      ctx.beginPath(); ctx.arc(n.x, n.y, 35, 0, Math.PI * 2);
-      ctx.fillStyle = grd; ctx.fill();
+
+    if (online) {
+      const pulse = (Math.sin(time / 900) + 1) / 2;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 21 + pulse * 5, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(34,197,94,' + (0.22 * (1 - pulse)).toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
     }
-    // Online indicator ring
-    if (isOnline) {
-      ctx.beginPath(); ctx.arc(n.x, n.y, 24, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(34,197,94,0.6)';
-      ctx.lineWidth = 2; ctx.stroke();
-      // Pulsing ring
-      const pulse = (Math.sin(time / 600) + 1) / 2;
-      ctx.beginPath(); ctx.arc(n.x, n.y, 24 + pulse * 6, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(34,197,94,${0.15 * (1 - pulse)})`;
-      ctx.lineWidth = 1.5; ctx.stroke();
-    }
-    // Phone body
+
     ctx.beginPath();
-    ctx.arc(n.x, n.y, 20, 0, Math.PI * 2);
-    ctx.fillStyle = isOnline ? '#1a3a2a' : '#1e2a45';
+    ctx.arc(n.x, n.y, 19, 0, Math.PI * 2);
+    ctx.fillStyle = online ? C.faceOn : C.faceOff;
     ctx.fill();
-    ctx.strokeStyle = isOnline ? '#22c55e' : '#475569';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = online ? C.online : '#33425e';
+    ctx.lineWidth = 1.3;
     ctx.stroke();
-    // Emoji icon
-    ctx.font = '16px sans-serif';
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText(isOnline ? '📶' : '📱', n.x, n.y);
-    // Label
-    const label = n.deviceId.replace('phone-', '');
-    ctx.font = '500 11px Inter, sans-serif';
-    ctx.fillStyle = '#94a3b8';
-    ctx.fillText(label, n.x, n.y + 34);
-    // Packet count badge
+
+    drawSignalGlyph(n.x, n.y, online);
+
+    ctx.font = '500 11px Inter, system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = C.label;
+    ctx.fillText(n.deviceId.replace('phone-', ''), n.x, n.y + 33);
+
     if (pkts > 0) {
       ctx.beginPath();
-      ctx.arc(n.x + 16, n.y - 16, 9, 0, Math.PI * 2);
-      ctx.fillStyle = '#6366f1';
+      ctx.arc(n.x + 15, n.y - 15, 8, 0, Math.PI * 2);
+      ctx.fillStyle = C.packet;
       ctx.fill();
-      ctx.font = 'bold 9px Inter, sans-serif';
+      ctx.font = '600 10px JetBrains Mono, monospace';
       ctx.fillStyle = '#fff';
-      ctx.fillText(pkts, n.x + 16, n.y - 15);
+      ctx.fillText(String(pkts), n.x + 15, n.y - 14.5);
     }
   });
 
-  requestAnimationFrame(draw);
+  rafId = requestAnimationFrame(draw);
 }
 
-// ─── Drag support ───
-canvas.addEventListener('mousedown', e => {
+// Chrome pauses rAF in a hidden tab anyway; stopping the loop and the poll
+// explicitly also stops the 5s request every backgrounded tab would keep making.
+function startLoop() { if (rafId === null) rafId = requestAnimationFrame(draw); }
+function stopLoop()  { if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; } }
+function startPoll() { if (pollId === null) pollId = setInterval(refresh, 5000); }
+function stopPoll()  { if (pollId !== null) { clearInterval(pollId); pollId = null; } }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { stopLoop(); stopPoll(); }
+  else { startLoop(); startPoll(); refresh(); }
+});
+
+// ─── Drag ────────────────────────────────────────────────────────────────────
+function pointAt(e) {
   const r = canvas.getBoundingClientRect();
-  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+canvas.addEventListener('pointerdown', e => {
+  const p = pointAt(e);
   for (const n of nodes) {
-    if (Math.hypot(mx - n.x, my - n.y) < 25) {
-      dragNode = n; dragOffX = mx - n.x; dragOffY = my - n.y;
+    if (Math.hypot(p.x - n.x, p.y - n.y) < 24) {
+      dragNode = n; dragOffX = p.x - n.x; dragOffY = p.y - n.y;
       canvas.classList.add('grabbing');
+      canvas.setPointerCapture(e.pointerId);
       break;
     }
   }
 });
-canvas.addEventListener('mousemove', e => {
-  if (!dragNode) return;
-  const r = canvas.getBoundingClientRect();
-  dragNode.x = e.clientX - r.left - dragOffX;
-  dragNode.y = e.clientY - r.top - dragOffY;
+canvas.addEventListener('pointermove', e => {
+  const p = pointAt(e);
+  if (dragNode) {
+    dragNode.x = Math.max(24, Math.min(viewW() - 24, p.x - dragOffX));
+    dragNode.y = Math.max(24, Math.min(viewH() - 24, p.y - dragOffY));
+    return;
+  }
+  hoverNode = nodes.find(n => Math.hypot(p.x - n.x, p.y - n.y) < 24) || null;
+  canvas.style.cursor = hoverNode ? 'grab' : 'default';
 });
-canvas.addEventListener('mouseup', () => { dragNode = null; canvas.classList.remove('grabbing'); });
-canvas.addEventListener('mouseleave', () => { dragNode = null; canvas.classList.remove('grabbing'); });
+canvas.addEventListener('pointerleave', () => { hoverNode = null; });
+function endDrag() { dragNode = null; canvas.classList.remove('grabbing'); }
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
 
-// ─── Animate packet transfer ───
+// ─── Packet animation ────────────────────────────────────────────────────────
 function animateTransfer(fromId, toId, color) {
   const from = nodes.find(n => n.deviceId === fromId);
   const to = nodes.find(n => n.deviceId === toId);
   if (!from || !to) return;
   animations.push({
     fromX: from.x, fromY: from.y, toX: to.x, toY: to.y,
-    start: Date.now() + Math.random() * 300, duration: 600 + Math.random() * 400,
-    color: color || 'rgb(99,102,241)'
+    start: Date.now() + Math.random() * 250,
+    duration: 550 + Math.random() * 350,
+    color: color || C.packet
   });
 }
 
-// ─── API helpers ───
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+// Device names come from a text input, so anything interpolated into innerHTML
+// gets escaped first.
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+function icon(id, cls) {
+  return `<svg class="icon ${cls || 'icon-sm'}" aria-hidden="true"><use href="#${id}"/></svg>`;
+}
+
+// ─── API ─────────────────────────────────────────────────────────────────────
 async function api(url, method = 'GET', body = null) {
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
   if (body) opts.body = JSON.stringify(body);
@@ -189,7 +272,16 @@ async function api(url, method = 'GET', body = null) {
   return r.json();
 }
 
-// ─── Refresh state ───
+// ─── Dependency strip ────────────────────────────────────────────────────────
+function setDep(id, state, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.dataset.state = state;
+  const val = el.querySelector('.dep-val');
+  if (val) val.textContent = value;
+}
+
+// ─── Refresh ─────────────────────────────────────────────────────────────────
 let refreshFailures = 0;
 let redisWarned = false;
 
@@ -198,7 +290,7 @@ function logRefreshFailure(e) {
   // refresh() polls every 5s. Log the first failure, then once a minute, so an
   // outage reports itself without flooding the log pane.
   if (refreshFailures === 1 || refreshFailures % 12 === 0) {
-    logMsg(`❌ Backend unreachable (${e.message}) — showing last known mesh state`, 'throttled');
+    logMsg(`Backend unreachable (${e.message}) — showing last known mesh state`, 'throttled');
   }
 }
 
@@ -211,16 +303,18 @@ async function refresh() {
     // Keep whatever is already drawn. Wiping every node because one poll failed
     // is what turned a backend outage into an empty canvas.
     logRefreshFailure(e);
+    setDep('depMesh', 'down', 'unreachable');
   }
 
   if (state) {
-    if (state.redisAvailable === false && !redisWarned) {
+    const redisUp = state.redisAvailable !== false;
+    setDep('depRedis', redisUp ? 'up' : 'down', redisUp ? 'connected' : 'unreachable');
+    if (!redisUp && !redisWarned) {
       redisWarned = true;
-      logMsg('⚠ Redis unreachable — settlement pipeline is offline. Mesh simulation still works, but Flush to Bank will not settle.', 'throttled');
+      logMsg('Redis unreachable — settlement pipeline offline. Gossip still works; Flush will not settle.', 'throttled');
     }
 
     const deviceData = state.devices || [];
-    // Update existing nodes or add new ones
     deviceData.forEach(d => {
       let n = nodes.find(nd => nd.deviceId === d.deviceId);
       if (n) {
@@ -228,225 +322,258 @@ async function refresh() {
         n.packetCount = d.packetCount;
         n.packetIds = d.packetIds;
       } else {
-        nodes.push({ deviceId: d.deviceId, hasInternet: d.hasInternet, packetCount: d.packetCount, packetIds: d.packetIds });
+        nodes.push({ deviceId: d.deviceId, hasInternet: d.hasInternet,
+                     packetCount: d.packetCount, packetIds: d.packetIds });
       }
     });
-    // Remove nodes no longer in backend
     nodes = nodes.filter(n => deviceData.some(d => d.deviceId === n.deviceId));
     layoutNodes();
     updateDeviceList();
+
+    const inFlight = nodes.reduce((s, n) => s + (n.packetCount || 0), 0);
+    const bridges = nodes.filter(n => n.hasInternet).length;
+    setText('mPackets', inFlight);
+    setText('mBridges', bridges);
+    setText('mDedup', state.idempotencyCacheSize ?? 0);
+    setDep('depMesh', 'up', nodes.length + ' active');
   }
 
-  // Balances and transactions come from Postgres and are independent of the
-  // mesh endpoint — keep them refreshing even when the mesh poll fails.
+  // Balances and the ledger come from Postgres and are independent of the mesh
+  // endpoint — keep them refreshing even when the mesh poll fails.
   updateAccounts();
   updateTransactions();
+}
+
+function setText(id, v) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = v;
 }
 
 function updateDeviceList() {
   const el = document.getElementById('deviceList');
   if (!el) return;
-  el.innerHTML = nodes.map(n => `
-    <div class="device-item">
-      <div class="device-status">
+  setText('deviceCount', nodes.length ? nodes.length : '');
+  if (!nodes.length) {
+    el.innerHTML = '<p class="empty">No devices in the mesh</p>';
+    return;
+  }
+  el.innerHTML = nodes.map(n => {
+    const id = esc(n.deviceId);
+    const name = esc(n.deviceId.replace('phone-', ''));
+    return `<div class="device-item">
+      <span class="device-status">
         <span class="status-dot ${n.hasInternet ? 'online' : 'offline'}"></span>
-        <span>${n.deviceId.replace('phone-','')}</span>
-        <span style="color:var(--text-dim);font-size:0.65rem;">(${n.packetCount || 0} pkts)</span>
-      </div>
-      <div style="display:flex;gap:4px;">
-        <button class="btn btn-ghost btn-sm" onclick="toggleInternet('${n.deviceId}')">${n.hasInternet ? '📴' : '📶'}</button>
-        <button class="btn btn-ghost btn-sm" onclick="removeDevice('${n.deviceId}')">✕</button>
-      </div>
-    </div>
-  `).join('');
+        <span class="device-name">${name}</span>
+        <span class="device-pkts">${n.packetCount || 0}p</span>
+      </span>
+      <span class="device-actions">
+        <button class="btn btn-ghost btn-icon" onclick="toggleInternet('${id}')"
+                title="${n.hasInternet ? 'Take offline' : 'Bring online'}"
+                aria-label="${n.hasInternet ? 'Take ' + name + ' offline' : 'Bring ' + name + ' online'}">
+          ${icon(n.hasInternet ? 'i-offline' : 'i-online')}
+        </button>
+        <button class="btn btn-ghost btn-icon btn-danger" onclick="removeDevice('${id}')"
+                title="Remove" aria-label="Remove ${name}">${icon('i-x')}</button>
+      </span>
+    </div>`;
+  }).join('');
 }
 
 async function updateAccounts() {
   try {
     const accs = await api('/api/accounts');
+    setDep('depDb', 'up', 'connected');
     const el = document.getElementById('accountList');
     if (!el) return;
     el.innerHTML = accs.map(a => `
       <div class="account-item">
-        <span class="account-name">${a.holderName} <span style="color:var(--text-dim);font-size:0.7rem;">(${a.vpa})</span></span>
-        <span class="account-bal">₹${parseFloat(a.balance).toFixed(2)}</span>
-      </div>
-    `).join('');
-  } catch(e) {}
+        <span class="account-name">${esc(a.holderName)}
+          <span class="account-vpa">${esc(a.vpa)}</span>
+        </span>
+        <span class="account-bal">₹${Number(a.balance).toFixed(2)}</span>
+      </div>`).join('');
+  } catch (e) {
+    setDep('depDb', 'down', 'unreachable');
+  }
 }
 
 async function updateTransactions() {
   try {
     const txs = await api('/api/transactions');
     const el = document.getElementById('txList');
-    const countEl = document.getElementById('txCount');
     if (!el) return;
-    if (countEl) countEl.textContent = txs && txs.length ? `(${txs.length})` : '';
-    if (!txs || txs.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-dim);font-size:0.7rem;">No transactions yet</div>';
+    setText('txCount', txs && txs.length ? txs.length : '');
+    setText('mSettled', txs ? txs.length : 0);
+    if (!txs || !txs.length) {
+      el.innerHTML = '<p class="empty">Nothing settled yet</p>';
       return;
     }
-    el.innerHTML = txs.slice(0, 10).map(tx =>
-      `<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:0.72rem;border-bottom:1px solid var(--border);">
-        <span><span style="color:var(--red);">${tx.senderVpa.split('@')[0]}</span> → <span style="color:var(--green);">${tx.receiverVpa.split('@')[0]}</span></span>
-        <span style="color:var(--orange);">₹${parseFloat(tx.amount).toFixed(0)}</span>
-      </div>`
-    ).join('');
-  } catch(e) {}
+    el.innerHTML = txs.slice(0, 10).map(tx => `
+      <div class="tx-item">
+        <span class="tx-party">${esc(tx.senderVpa.split('@')[0])}
+          <span class="tx-arrow">&rarr;</span>
+          ${esc(tx.receiverVpa.split('@')[0])}</span>
+        <span class="tx-amt">₹${Number(tx.amount).toFixed(0)}</span>
+      </div>`).join('');
+  } catch (e) { /* ledger unavailable; the dependency strip already says so */ }
 }
 
-// ─── Actions ───
+// ─── Actions ─────────────────────────────────────────────────────────────────
 async function sendPacket() {
-  const sender = document.getElementById('senderVpa').value;
-  const receiver = document.getElementById('receiverVpa').value;
+  const senderVpa = document.getElementById('senderVpa').value;
+  const receiverVpa = document.getElementById('receiverVpa').value;
   const amount = parseFloat(document.getElementById('amount').value);
   const pin = document.getElementById('pin').value;
   try {
-    const r = await api('/api/demo/send', 'POST', { senderVpa: sender, receiverVpa: receiver, amount, pin });
-    logMsg(`📤 Packet ${r.packetId.substring(0,8)} encrypted & injected at ${r.injectedAt} (TTL ${r.ttl})`, 'accepted');
-    toast('🔐 Packet encrypted with RSA-2048 + AES-256-GCM');
+    const r = await api('/api/demo/send', 'POST', { senderVpa, receiverVpa, amount, pin });
+    logMsg(`Packet ${r.packetId.substring(0, 8)} encrypted, injected at ${r.injectedAt} (ttl ${r.ttl})`, 'accepted');
+    toast('Packet sealed with RSA-2048 + AES-256-GCM');
     refresh();
-  } catch(e) { logMsg('❌ Failed to inject packet', 'throttled'); }
+  } catch (e) {
+    logMsg(`Inject failed (${e.message})`, 'throttled');
+  }
 }
 
 async function gossip() {
   try {
-    // Compute which devices are within BLE range of each other
+    // Only devices within BLE range of each other may exchange packets.
     const neighbors = {};
     nodes.forEach(n => { neighbors[n.deviceId] = []; });
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
-        const dist = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y);
-        if (dist <= bluetoothRange * 2) {
+        if (Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y) <= bluetoothRange * 2) {
           neighbors[nodes[i].deviceId].push(nodes[j].deviceId);
           neighbors[nodes[j].deviceId].push(nodes[i].deviceId);
         }
       }
     }
-    // Send neighbor map so backend only gossips between in-range pairs
     const r = await api('/api/mesh/gossip', 'POST', neighbors);
-    logMsg(`🔄 Gossip: ${r.transfers} transfer(s) — ${JSON.stringify(r.deviceCounts)}`);
-    // Animate transfers between in-range pairs only
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        const dist = Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y);
-        if (dist <= bluetoothRange * 2 && r.transfers > 0) {
-          animateTransfer(nodes[i].deviceId, nodes[j].deviceId, 'rgb(99,102,241)');
-          animateTransfer(nodes[j].deviceId, nodes[i].deviceId, 'rgb(99,102,241)');
+    logMsg(`Gossip round: ${r.transfers} transfer(s)`);
+    if (r.transfers > 0) {
+      for (let i = 0; i < nodes.length; i++) {
+        for (let j = i + 1; j < nodes.length; j++) {
+          if (Math.hypot(nodes[i].x - nodes[j].x, nodes[i].y - nodes[j].y) <= bluetoothRange * 2) {
+            animateTransfer(nodes[i].deviceId, nodes[j].deviceId);
+            animateTransfer(nodes[j].deviceId, nodes[i].deviceId);
+          }
         }
       }
     }
     refresh();
-  } catch(e) { logMsg('❌ Gossip failed', 'throttled'); }
+  } catch (e) {
+    logMsg(`Gossip failed (${e.message})`, 'throttled');
+  }
 }
 
 async function flushBridges() {
   try {
     const r = await api('/api/mesh/flush', 'POST');
-    logMsg(`📡 ${r.uploadsAttempted} bridge upload(s):`);
+    logMsg(`${r.uploadsAttempted} bridge upload(s)`);
     r.results.forEach(res => {
       const isVip = res.hopCount === 0;
-      const vipTag = isVip ? ' ⭐VIP' : '';
-      const icon = res.outcome === 'ACCEPTED_FOR_PROCESSING' ? '⚡'
-                 : res.outcome === 'DUPLICATE_DROPPED' ? '🔁'
-                 : res.outcome === 'THROTTLED' ? '🛑' : '❌';
       const cls = res.outcome === 'ACCEPTED_FOR_PROCESSING' ? 'accepted'
                 : res.outcome === 'THROTTLED' ? 'throttled'
-                : res.outcome === 'DUPLICATE_DROPPED' ? 'duplicate' : '';
-      logMsg(`  ${icon} [${res.bridgeNode}] ${res.packetId} → ${res.outcome}${vipTag}`, isVip ? 'vip' : cls);
-      // Animate bridge → bank (upward)
+                : res.outcome === 'DUPLICATE_DROPPED' ? 'duplicate' : 'throttled';
+      logMsg(`  [${res.bridgeNode}] ${res.packetId} ${res.outcome}${isVip ? ' VIP' : ''}`,
+             isVip && cls === 'accepted' ? 'vip' : cls);
       if (res.outcome === 'ACCEPTED_FOR_PROCESSING') {
         const bn = nodes.find(n => n.deviceId === res.bridgeNode);
         if (bn) {
           animations.push({
-            fromX: bn.x, fromY: bn.y, toX: bn.x, toY: bn.y - 120,
-            start: Date.now(), duration: 1000, color: 'rgb(34,197,94)'
+            fromX: bn.x, fromY: bn.y, toX: bn.x, toY: bn.y - 110,
+            start: Date.now(), duration: 900, color: C.online
           });
         }
       }
     });
-    logMsg('  ↪ AsyncDecryptionWorker processing in background...');
+    logMsg('  worker decrypting in background');
     setTimeout(refresh, 1500);
-  } catch(e) { logMsg('❌ Failed to flush bridges', 'throttled'); }
+  } catch (e) {
+    logMsg(`Flush failed (${e.message})`, 'throttled');
+  }
 }
 
 async function resetMesh() {
   try {
     await api('/api/mesh/reset', 'POST');
-    logMsg('🗑 Full system reset: Mesh + Redis + DB cleared');
-    // Keep node positions intact, just reset their packet counts visually
+    logMsg('System reset: mesh, dedup cache, queue and ledger cleared');
     nodes.forEach(n => { n.packetCount = 0; n.packetIds = []; });
   } catch (e) {
-    // The reset endpoint clears the Redis idempotency cache and queue first, so
-    // it fails as a unit whenever Redis is down.
-    logMsg(`❌ Reset failed (${e.message}) — needs Redis`, 'throttled');
+    // Reset clears the Redis dedup cache and queue first, so it fails as a unit
+    // whenever Redis is down.
+    logMsg(`Reset failed (${e.message}) — requires Redis`, 'throttled');
   }
   refresh();
 }
 
 async function toggleInternet(deviceId) {
   try {
-    await api(`/api/mesh/device/${deviceId}/toggle-internet`, 'POST');
+    await api(`/api/mesh/device/${encodeURIComponent(deviceId)}/toggle-internet`, 'POST');
     const n = nodes.find(nd => nd.deviceId === deviceId);
-    logMsg(`⚡ ${deviceId} → ${n && !n.hasInternet ? 'ONLINE' : 'OFFLINE'}`);
+    logMsg(`${deviceId} is now ${n && !n.hasInternet ? 'ONLINE' : 'OFFLINE'}`);
   } catch (e) {
-    logMsg(`❌ Could not toggle ${deviceId} (${e.message})`, 'throttled');
+    logMsg(`Could not toggle ${deviceId} (${e.message})`, 'throttled');
   }
   refresh();
 }
 
 async function addDeviceFromForm() {
   const input = document.getElementById('newDeviceId');
-  const id = 'phone-' + input.value.trim().toLowerCase().replace(/\s+/g, '-');
-  if (!input.value.trim()) return;
+  const raw = input.value.trim();
+  if (!raw) return;
+  const id = 'phone-' + raw.toLowerCase().replace(/\s+/g, '-');
   try {
     await api('/api/mesh/device/add', 'POST', { deviceId: id, hasInternet: false });
     input.value = '';
-    logMsg(`➕ Added device ${id}`);
+    logMsg(`Added ${id}`);
   } catch (e) {
-    logMsg(`❌ Could not add ${id} (${e.message})`, 'throttled');
+    logMsg(`Could not add ${id} (${e.message})`, 'throttled');
   }
   refresh();
 }
 
 async function removeDevice(deviceId) {
   try {
-    await api(`/api/mesh/device/${deviceId}/remove`, 'POST');
-    logMsg(`➖ Removed device ${deviceId}`);
+    await api(`/api/mesh/device/${encodeURIComponent(deviceId)}/remove`, 'POST');
+    logMsg(`Removed ${deviceId}`);
   } catch (e) {
-    logMsg(`❌ Could not remove ${deviceId} (${e.message})`, 'throttled');
+    logMsg(`Could not remove ${deviceId} (${e.message})`, 'throttled');
   }
   refresh();
 }
 
-// ─── Log ───
+// ─── Log ─────────────────────────────────────────────────────────────────────
 function logMsg(msg, cls = '') {
   const el = document.getElementById('activityLog');
   if (!el) return;
-  const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
   const div = document.createElement('div');
   div.className = 'log-entry' + (cls ? ' ' + cls : '');
-  div.textContent = `[${ts}] ${msg}`;
+  const ts = document.createElement('span');
+  ts.className = 'ts';
+  ts.textContent = new Date().toLocaleTimeString('en-GB', { hour12: false });
+  div.appendChild(ts);
+  div.appendChild(document.createTextNode(msg));
   el.prepend(div);
-  // Keep max 100 entries
   while (el.children.length > 100) el.removeChild(el.lastChild);
 }
 
 function toast(msg) {
   const t = document.createElement('div');
   t.className = 'toast';
+  t.setAttribute('role', 'status');
   t.textContent = msg;
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 3000);
 }
 
-// ─── Range slider ───
+// ─── Range ───────────────────────────────────────────────────────────────────
 function updateRange(val) {
-  bluetoothRange = parseInt(val);
-  document.getElementById('rangeVal').textContent = val + 'px';
+  bluetoothRange = parseInt(val, 10);
+  setText('rangeVal', val + 'px');
+  rangeRevealUntil = Date.now() + 1400;   // show every ring while the user tunes
 }
 
-// ─── Init ───
+// ─── Init ────────────────────────────────────────────────────────────────────
 refresh();
-draw();
-setInterval(refresh, 5000);
+startLoop();
+startPoll();
