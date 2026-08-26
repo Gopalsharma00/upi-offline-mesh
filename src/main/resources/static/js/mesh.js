@@ -14,15 +14,15 @@ const ctx = canvas.getContext('2d');
 
 // Palette mirrors the CSS custom properties so canvas and DOM stay in step.
 const C = {
-  online:  '#22c55e',
-  offline: '#64748b',
-  packet:  '#3b82f6',
-  vip:     '#f59e0b',
-  label:   '#94a3b8',
-  ring:    'rgba(59,130,246,0.07)',
-  link:    'rgba(96,125,170,',
-  faceOn:  '#12301f',
-  faceOff: '#16203a',
+  online:  '#3fb950',
+  offline: '#56606e',
+  packet:  '#4c8dff',
+  vip:     '#d29922',
+  label:   '#8695a8',
+  ring:    'rgba(76,141,255,0.06)',
+  link:    'rgba(110,130,160,',
+  faceOn:  '#132a1a',
+  faceOff: '#161c27',
 };
 
 // ─── Sizing ──────────────────────────────────────────────────────────────────
@@ -97,7 +97,7 @@ function draw() {
     if (!focused && !revealAll) return;
     ctx.beginPath();
     ctx.arc(n.x, n.y, bluetoothRange, 0, Math.PI * 2);
-    ctx.strokeStyle = focused ? 'rgba(59,130,246,0.30)' : C.ring;
+    ctx.strokeStyle = focused ? 'rgba(76,141,255,0.28)' : C.ring;
     ctx.setLineDash(focused ? [] : [2, 6]);
     ctx.lineWidth = 1;
     ctx.stroke();
@@ -161,7 +161,7 @@ function draw() {
       const pulse = (Math.sin(time / 900) + 1) / 2;
       ctx.beginPath();
       ctx.arc(n.x, n.y, 21 + pulse * 5, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(34,197,94,' + (0.22 * (1 - pulse)).toFixed(3) + ')';
+      ctx.strokeStyle = 'rgba(63,185,80,' + (0.2 * (1 - pulse)).toFixed(3) + ')';
       ctx.lineWidth = 1.2;
       ctx.stroke();
     }
@@ -170,7 +170,7 @@ function draw() {
     ctx.arc(n.x, n.y, 19, 0, Math.PI * 2);
     ctx.fillStyle = online ? C.faceOn : C.faceOff;
     ctx.fill();
-    ctx.strokeStyle = online ? C.online : '#33425e';
+    ctx.strokeStyle = online ? C.online : '#2f3a4a';
     ctx.lineWidth = 1.3;
     ctx.stroke();
 
@@ -281,6 +281,21 @@ function setDep(id, state, value) {
   if (val) val.textContent = value;
 }
 
+let stateResetId = null;
+function setState(text, kind = '') {
+  const el = document.getElementById('stState');
+  if (!el) return;
+  el.textContent = text;
+  el.dataset.state = kind;
+  clearTimeout(stateResetId);
+  if (kind !== 'down') {
+    stateResetId = setTimeout(() => {
+      el.textContent = 'idle';
+      el.dataset.state = '';
+    }, 2500);
+  }
+}
+
 // ─── Refresh ─────────────────────────────────────────────────────────────────
 let refreshFailures = 0;
 let redisWarned = false;
@@ -290,7 +305,7 @@ function logRefreshFailure(e) {
   // refresh() polls every 5s. Log the first failure, then once a minute, so an
   // outage reports itself without flooding the log pane.
   if (refreshFailures === 1 || refreshFailures % 12 === 0) {
-    logMsg(`Backend unreachable (${e.message}) — showing last known mesh state`, 'throttled');
+    logMsg(`backend unreachable (${e.message}), showing last known state`, 'throttled');
   }
 }
 
@@ -303,15 +318,15 @@ async function refresh() {
     // Keep whatever is already drawn. Wiping every node because one poll failed
     // is what turned a backend outage into an empty canvas.
     logRefreshFailure(e);
-    setDep('depMesh', 'down', 'unreachable');
+    setDep('depMesh', 'down', 'down');
   }
 
   if (state) {
     const redisUp = state.redisAvailable !== false;
-    setDep('depRedis', redisUp ? 'up' : 'down', redisUp ? 'connected' : 'unreachable');
+    setDep('depRedis', redisUp ? 'up' : 'down', redisUp ? 'ok' : 'down');
     if (!redisUp && !redisWarned) {
       redisWarned = true;
-      logMsg('Redis unreachable — settlement pipeline offline. Gossip still works; Flush will not settle.', 'throttled');
+      logMsg('redis unreachable: settlement offline. gossip works, flush will not settle', 'throttled');
     }
 
     const deviceData = state.devices || [];
@@ -335,7 +350,7 @@ async function refresh() {
     setText('mPackets', inFlight);
     setText('mBridges', bridges);
     setText('mDedup', state.idempotencyCacheSize ?? 0);
-    setDep('depMesh', 'up', nodes.length + ' active');
+    setDep('depMesh', 'up', nodes.length + 'n');
   }
 
   // Balances and the ledger come from Postgres and are independent of the mesh
@@ -354,46 +369,41 @@ function updateDeviceList() {
   if (!el) return;
   setText('deviceCount', nodes.length ? nodes.length : '');
   if (!nodes.length) {
-    el.innerHTML = '<p class="empty">No devices in the mesh</p>';
+    el.innerHTML = '<tr class="empty"><td colspan="3">no nodes</td></tr>';
     return;
   }
   el.innerHTML = nodes.map(n => {
     const id = esc(n.deviceId);
     const name = esc(n.deviceId.replace('phone-', ''));
-    return `<div class="device-item">
-      <span class="device-status">
-        <span class="status-dot ${n.hasInternet ? 'online' : 'offline'}"></span>
-        <span class="device-name">${name}</span>
-        <span class="device-pkts">${n.packetCount || 0}p</span>
-      </span>
-      <span class="device-actions">
-        <button class="btn btn-ghost btn-icon" onclick="toggleInternet('${id}')"
-                title="${n.hasInternet ? 'Take offline' : 'Bring online'}"
+    const pkts = n.packetCount || 0;
+    return `<tr>
+      <td><i class="n-dot ${n.hasInternet ? 'on' : ''}"></i><span class="n-name">${name}</span></td>
+      <td class="num n-pkts ${pkts ? 'hot' : ''}">${pkts}</td>
+      <td class="act">
+        <button class="rowbtn" onclick="toggleInternet('${id}')"
+                title="${n.hasInternet ? 'take offline' : 'bring online'}"
                 aria-label="${n.hasInternet ? 'Take ' + name + ' offline' : 'Bring ' + name + ' online'}">
-          ${icon(n.hasInternet ? 'i-offline' : 'i-online')}
-        </button>
-        <button class="btn btn-ghost btn-icon btn-danger" onclick="removeDevice('${id}')"
-                title="Remove" aria-label="Remove ${name}">${icon('i-x')}</button>
-      </span>
-    </div>`;
+          ${icon(n.hasInternet ? 'i-offline' : 'i-online')}</button>
+        <button class="rowbtn danger" onclick="removeDevice('${id}')"
+                title="remove" aria-label="Remove ${name}">${icon('i-x')}</button>
+      </td>
+    </tr>`;
   }).join('');
 }
 
 async function updateAccounts() {
   try {
     const accs = await api('/api/accounts');
-    setDep('depDb', 'up', 'connected');
+    setDep('depDb', 'up', 'ok');
     const el = document.getElementById('accountList');
     if (!el) return;
-    el.innerHTML = accs.map(a => `
-      <div class="account-item">
-        <span class="account-name">${esc(a.holderName)}
-          <span class="account-vpa">${esc(a.vpa)}</span>
-        </span>
-        <span class="account-bal">₹${Number(a.balance).toFixed(2)}</span>
-      </div>`).join('');
+    el.innerHTML = accs.map(a => `<tr>
+        <td>${esc(a.holderName)}</td>
+        <td class="vpa">${esc(a.vpa)}</td>
+        <td class="num bal">${Number(a.balance).toFixed(2)}</td>
+      </tr>`).join('');
   } catch (e) {
-    setDep('depDb', 'down', 'unreachable');
+    setDep('depDb', 'down', 'down');
   }
 }
 
@@ -405,17 +415,15 @@ async function updateTransactions() {
     setText('txCount', txs && txs.length ? txs.length : '');
     setText('mSettled', txs ? txs.length : 0);
     if (!txs || !txs.length) {
-      el.innerHTML = '<p class="empty">Nothing settled yet</p>';
+      el.innerHTML = '<tr class="empty"><td colspan="3">nothing settled</td></tr>';
       return;
     }
-    el.innerHTML = txs.slice(0, 10).map(tx => `
-      <div class="tx-item">
-        <span class="tx-party">${esc(tx.senderVpa.split('@')[0])}
-          <span class="tx-arrow">&rarr;</span>
-          ${esc(tx.receiverVpa.split('@')[0])}</span>
-        <span class="tx-amt">₹${Number(tx.amount).toFixed(0)}</span>
-      </div>`).join('');
-  } catch (e) { /* ledger unavailable; the dependency strip already says so */ }
+    el.innerHTML = txs.slice(0, 10).map(tx => `<tr>
+        <td>${esc(tx.senderVpa.split('@')[0])}</td>
+        <td>${esc(tx.receiverVpa.split('@')[0])}</td>
+        <td class="num amt">${Number(tx.amount).toFixed(0)}</td>
+      </tr>`).join('');
+  } catch (e) { /* the dependency strip already reports the outage */ }
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -426,8 +434,9 @@ async function sendPacket() {
   const pin = document.getElementById('pin').value;
   try {
     const r = await api('/api/demo/send', 'POST', { senderVpa, receiverVpa, amount, pin });
-    logMsg(`Packet ${r.packetId.substring(0, 8)} encrypted, injected at ${r.injectedAt} (ttl ${r.ttl})`, 'accepted');
-    toast('Packet sealed with RSA-2048 + AES-256-GCM');
+    logMsg(`packet ${r.packetId.substring(0, 8)} sealed, injected at ${r.injectedAt} ttl=${r.ttl}`, 'accepted');
+    toast('RSA-2048 + AES-256-GCM');
+    setState('injected');
     refresh();
   } catch (e) {
     logMsg(`Inject failed (${e.message})`, 'throttled');
@@ -448,7 +457,8 @@ async function gossip() {
       }
     }
     const r = await api('/api/mesh/gossip', 'POST', neighbors);
-    logMsg(`Gossip round: ${r.transfers} transfer(s)`);
+    logMsg(`gossip: ${r.transfers} transfer(s)`);
+    setState(`gossip ${r.transfers}`);
     if (r.transfers > 0) {
       for (let i = 0; i < nodes.length; i++) {
         for (let j = i + 1; j < nodes.length; j++) {
@@ -468,7 +478,8 @@ async function gossip() {
 async function flushBridges() {
   try {
     const r = await api('/api/mesh/flush', 'POST');
-    logMsg(`${r.uploadsAttempted} bridge upload(s)`);
+    logMsg(`flush: ${r.uploadsAttempted} bridge upload(s)`);
+    setState('flushing', 'busy');
     r.results.forEach(res => {
       const isVip = res.hopCount === 0;
       const cls = res.outcome === 'ACCEPTED_FOR_PROCESSING' ? 'accepted'
@@ -486,7 +497,7 @@ async function flushBridges() {
         }
       }
     });
-    logMsg('  worker decrypting in background');
+    logMsg('  worker decrypting');
     setTimeout(refresh, 1500);
   } catch (e) {
     logMsg(`Flush failed (${e.message})`, 'throttled');
@@ -496,7 +507,8 @@ async function flushBridges() {
 async function resetMesh() {
   try {
     await api('/api/mesh/reset', 'POST');
-    logMsg('System reset: mesh, dedup cache, queue and ledger cleared');
+    logMsg('reset: mesh, dedup cache, queue and ledger cleared');
+    setState('reset');
     nodes.forEach(n => { n.packetCount = 0; n.packetIds = []; });
   } catch (e) {
     // Reset clears the Redis dedup cache and queue first, so it fails as a unit
@@ -569,9 +581,20 @@ function toast(msg) {
 // ─── Range ───────────────────────────────────────────────────────────────────
 function updateRange(val) {
   bluetoothRange = parseInt(val, 10);
-  setText('rangeVal', val + 'px');
+  setText('rangeVal', val);
   rangeRevealUntil = Date.now() + 1400;   // show every ring while the user tunes
 }
+
+// Real consoles are driven from the keyboard. Ignore the shortcut while the
+// user is typing into a field.
+const KEYS = { i: sendPacket, g: gossip, f: flushBridges, r: resetMesh };
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  const fn = KEYS[e.key.toLowerCase()];
+  if (fn) { e.preventDefault(); fn(); }
+});
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 refresh();
